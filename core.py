@@ -11,7 +11,13 @@ class Crossing:
         if a==b or direction not in (-1,1): raise ValueError("Invalid line")
         self.a,self.b,self.direction,self.margin=a,b,direction,margin
         self.tracks={}
-    def update(self,tid,p,kind,frame):
+        self.votes={}
+        self.last_event=None
+    def update(self,tid,p,kind,frame,confidence=1.0):
+        self.last_event=None
+        if kind not in ('car','motor'):raise ValueError('Unknown vehicle group')
+        votes=self.votes.setdefault(tid,{'car':0.0,'motor':0.0})
+        votes[kind]+=float(confidence)
         ax,ay=self.a; dx=self.b[0]-ax;dy=self.b[1]-ay
         length=(dx*dx+dy*dy)**.5
         distance=(dx*(p[1]-ay)-dy*(p[0]-ax))/length
@@ -30,9 +36,14 @@ class Crossing:
             u=((x-ax)*dx+(y-ay)*dy)/(length*length)
             hit=0<=u<=1
         self.tracks[tid]=(side,p,done or hit,frame)
-        return kind if hit else None
+        if hit:
+            stable=max(votes,key=lambda k:(votes[k],k==kind))
+            self.last_event=(tid,kind,stable,dict(votes))
+            return stable
+        return None
     def prune(self,frame):
         self.tracks={k:v for k,v in self.tracks.items() if frame-v[3]<600}
+        self.votes={k:v for k,v in self.votes.items() if k in self.tracks}
 class Store:
     def __init__(self,path):
         self.path=path

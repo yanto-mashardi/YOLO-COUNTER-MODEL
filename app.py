@@ -201,10 +201,13 @@ class Panel:
             result=model.track(frame,persist=True,tracker=c["tracker"],classes=list(classes),conf=float(c["conf"]),iou=float(c["iou"]),imgsz=int(c["size"]),device=device,verbose=False)[0]
             frame_id+=1;h,w=frame.shape[:2];changed=False
             if result.boxes.id is not None:
-                for xy,tid,cls in zip(result.boxes.xyxy.cpu().tolist(),result.boxes.id.int().cpu().tolist(),result.boxes.cls.int().cpu().tolist()):
-                    x1,y1,x2,y2=xy;kind=counter.update(tid,((x1+x2)/(2*w),y2/h),classes[cls],frame_id)
+                for xy,tid,cls,conf in zip(result.boxes.xyxy.cpu().tolist(),result.boxes.id.int().cpu().tolist(),result.boxes.cls.int().cpu().tolist(),result.boxes.conf.cpu().tolist()):
+                    x1,y1,x2,y2=xy;kind=counter.update(tid,((x1+x2)/(2*w),y2/h),classes[cls],frame_id,conf)
                     if kind=="car":car+=1;changed=True
                     elif kind=="motor":motor+=1;changed=True
+                    if kind:
+                        tid0,raw,stable,votes=counter.last_event
+                        print(f'COUNT {self.port} ID={tid0} frame={frame_id} raw={raw} counted={stable} votes={votes}',flush=True)
             counter.prune(frame_id)
             if changed or time.monotonic()-last>=10:
                 store.snapshot(self.port,car,motor,t);last=time.monotonic()
