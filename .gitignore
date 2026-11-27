@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pt
+*.sqlite*
+*.mp4
+*.avi
+*.jpg
+*.csv
+installed_versions.txt
+local_config.json
