@@ -36,6 +36,9 @@ class Panel:
     field("size","Input size","640",["320","480","640","960"])
     field("line","Garis x1,y1,x2,y2 (0-1)",".1,.5,.9,.5")
     field("direction","Arah masuk","1",["1","-1"])
+    self.line_button=ttk.Button(self.frame,text="Atur garis hitung pada video",command=self.edit_line);self.line_button.pack(fill="x",pady=4)
+    self.calibration_source=None;self.calibrating=False
+    self.vars["source"].trace_add("write",lambda *_:setattr(self,"calibration_source",None))
     field("mode","Mode","VALIDATION",["VALIDATION","OPERATIONAL"])
     field("identity","Identitas publisher",os.environ.get("COMPUTERNAME","PC-KAMPUS-YOLO"))
     field("token","Token resmi per pelabuhan","",secret=True)
@@ -52,7 +55,91 @@ class Panel:
  def custom(self):
     p=filedialog.askopenfilename(filetypes=[("Trusted YOLO weights","*.pt")])
     if p:self.vars["model"].set(p)
+ def edit_line(self):
+    if self.calibrating or (self.worker and self.worker.is_alive()) or (self.sender and self.sender.is_alive()):
+        messagebox.showinfo("Pengaturan garis","Hentikan pemrosesan terlebih dahulu.");return
+    source=self.vars["source"].get().strip()
+    if not source:
+        messagebox.showwarning("Sumber video","Masukkan RTSP atau pilih file video dahulu.");return
+    self.calibrating=True;self.line_button.configure(state="disabled")
+    result=queue.Queue(1)
+    def read():
+        cap=None
+        try:
+            cap=cv2.VideoCapture(source,cv2.CAP_FFMPEG,[cv2.CAP_PROP_OPEN_TIMEOUT_MSEC,8000,cv2.CAP_PROP_READ_TIMEOUT_MSEC,8000])
+            ok,frame=cap.read()
+            if not ok:raise RuntimeError("No frame")
+            result.put(Image.fromarray(cv2.cvtColor(frame,cv2.COLOR_BGR2RGB)))
+        except Exception:result.put(None)
+        finally:
+            if cap is not None:cap.release()
+    threading.Thread(target=read,daemon=True).start()
+    self.info.set("Membaca frame untuk pengaturan garis...")
+    def poll():
+        try:im=result.get_nowait()
+        except queue.Empty:self.frame.after(100,poll);return
+        self.calibrating=False;self.line_button.configure(state="normal")
+        if im is None:
+            self.info.set("Preview gagal")
+            messagebox.showerror("Preview","Frame tidak dapat dibaca. Periksa sumber video.");return
+        if source!=self.vars["source"].get().strip():return
+        self.line_dialog(im,source)
+    self.frame.after(100,poll)
+ def line_dialog(self,im,source):
+    win=tk.Toplevel(self.frame);win.title("Atur garis hitung — "+self.port.upper());win.transient(self.frame.winfo_toplevel())
+    im.thumbnail((min(1100,win.winfo_screenwidth()-100),min(620,win.winfo_screenheight()-240)))
+    w,h=im.size
+    photo=ImageTk.PhotoImage(im,master=win)
+    ttk.Label(win,text="Klik titik awal dan titik akhir garis. Panah menunjukkan arah kendaraan masuk.",wraplength=w).pack(padx=8,pady=6)
+    canvas=tk.Canvas(win,width=w,height=h,highlightthickness=0,cursor="crosshair");canvas.pack(padx=8)
+    canvas.create_image(0,0,image=photo,anchor="nw");canvas.image=photo
+    points=[];direction=tk.IntVar(value=int(self.vars["direction"].get()))
+    try:
+        a=list(map(float,self.vars["line"].get().split(",")))
+        if len(a)==4 and all(0<=v<=1 for v in a) and a[:2]!=a[2:]:points[:]=[(a[0],a[1]),(a[2],a[3])]
+    except ValueError:pass
+    def draw():
+        canvas.delete("overlay")
+        for x,y in points:
+            canvas.create_oval(x*w-5,y*h-5,x*w+5,y*h+5,fill="#ffe000",outline="black",tags="overlay")
+        if len(points)==2:
+            (x1,y1),(x2,y2)=points
+            canvas.create_line(x1*w,y1*h,x2*w,y2*h,fill="#ffe000",width=3,tags="overlay")
+            # Direction is normal to the line in normalized image coordinates.
+            dx,dy=x2-x1,y2-y1;n=(dx*dx+dy*dy)**.5
+            if n:
+                mx,my=(x1+x2)*w/2,(y1+y2)*h/2
+                vx,vy=-dy*w/n*direction.get(),dx*h/n*direction.get()
+                scale=36/max(1,(vx*vx+vy*vy)**.5);vx*=scale;vy*=scale
+                canvas.create_line(mx-vx,my-vy,mx+vx,my+vy,fill="#00ffff",width=4,arrow="last",tags="overlay")
+    def click(e):
+        p=(min(1,max(0,e.x/w)),min(1,max(0,e.y/h)))
+        if len(points)==2:points.clear()
+        if points and ((p[0]-points[0][0])**2+(p[1]-points[0][1])**2)**.5<.01:return
+        points.append(p);draw()
+    def save():
+        if len(points)!=2:
+            messagebox.showwarning("Garis","Tentukan dua titik garis.",parent=win);return
+        if source!=self.vars["source"].get().strip():
+            messagebox.showwarning("Sumber","Sumber video berubah. Buka pengaturan ulang.",parent=win);win.destroy();return
+        self.vars["line"].set(",".join(f"{v:.6f}" for p in points for v in p))
+        self.vars["direction"].set(str(direction.get()));self.calibration_source=source
+        draw()
+        # Render saved calibration in the main panel without running inference.
+        preview=im.copy()
+        from PIL import ImageDraw
+        pen=ImageDraw.Draw(preview);pen.line([(x*w,y*h) for x,y in points],fill="yellow",width=3)
+        preview.thumbnail((600,340));self.photo=ImageTk.PhotoImage(preview);self.preview.configure(image=self.photo,text="")
+        self.info.set("Garis disimpan — siap Start");win.destroy()
+    canvas.bind("<Button-1>",click)
+    bar=ttk.Frame(win);bar.pack(fill="x",padx=8,pady=8)
+    ttk.Button(bar,text="Ulangi garis",command=lambda:(points.clear(),draw())).pack(side="left",padx=3)
+    ttk.Button(bar,text="Balik arah masuk",command=lambda:(direction.set(-direction.get()),draw())).pack(side="left",padx=3)
+    ttk.Button(bar,text="Batal",command=win.destroy).pack(side="right",padx=3)
+    ttk.Button(bar,text="Simpan garis",command=save).pack(side="right",padx=3)
+    draw();win.grab_set()
  def start(self):
+    if self.calibrating:return
     if self.worker and self.worker.is_alive():return
     if self.sender and self.sender.is_alive():return
     c={k:v.get() for k,v in self.vars.items()}
@@ -63,6 +150,8 @@ class Panel:
         Crossing(a[:2],a[2:],int(c["direction"]))
         if c["device"]=="0" and not torch.cuda.is_available():raise ValueError("CUDA unavailable")
         if c["mode"]=="OPERATIONAL":
+            if self.calibration_source!=c["source"].strip():
+                messagebox.showwarning("Kalibrasi","Atur dan simpan garis untuk sumber video ini sebelum mode operasional.");return
             assert c["source"].startswith("rtsp://") and c["token"] and c["identity"].strip()
             if not messagebox.askyesno("Commissioning","Aktifkan pengiriman resmi? Pastikan garis dan arah tervalidasi, publisher Manager cocok, counter awal direkonsiliasi, dan tidak ada pengirim lain."):return
     except Exception:
