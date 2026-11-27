@@ -8,7 +8,7 @@ from pathlib import Path
 import cv2,torch
 from PIL import Image,ImageTk
 from ultralytics import YOLO
-from core import Crossing,Store,now,send_pending
+from core import Crossing,Store,now,send_pending,roi_bounds,roi_pixels,inside_roi,vehicle_group,add_count
 ROOT=Path(os.environ.get("LOCALAPPDATA",str(Path.home())))/"YOLO_COUNTER_MODEL"
 ROOT.mkdir(parents=True,exist_ok=True)
 BASE="https://eta-etd.gudang-apps.my.id"
@@ -36,9 +36,12 @@ class Panel:
     field("size","Input size","640",["320","480","640","960"])
     field("line","Garis x1,y1,x2,y2 (0-1)",".1,.5,.9,.5")
     field("direction","Arah masuk","1",["1","-1"])
-    self.line_button=ttk.Button(self.frame,text="Atur garis hitung pada video",command=self.edit_line);self.line_button.pack(fill="x",pady=4)
+    self.vars["roi"]=tk.StringVar(value="0,0,1,1")
+    self.line_button=ttk.Button(self.frame,text="Atur area deteksi & garis hitung",command=self.edit_line);self.line_button.pack(fill="x",pady=4)
     self.calibration_source=None;self.calibrating=False
-    self.vars["source"].trace_add("write",lambda *_:setattr(self,"calibration_source",None))
+    self.vars["source"].trace_add("write",self.invalidate_source)
+    self.vars["line"].trace_add("write",lambda *_:setattr(self,"calibration_source",None))
+    self.vars["direction"].trace_add("write",lambda *_:setattr(self,"calibration_source",None))
     field("mode","Mode","VALIDATION",["VALIDATION","OPERATIONAL"])
     field("identity","Identitas publisher",os.environ.get("COMPUTERNAME","PC-KAMPUS-YOLO"))
     field("token","Token resmi per pelabuhan","",secret=True)
@@ -52,6 +55,9 @@ class Panel:
     self.net=tk.StringVar(value="PUBLISH OFF");ttk.Label(self.frame,textvariable=self.net,wraplength=500).pack(anchor="w")
     self.store=None
     self.frame.after(100,self.tick)
+ def invalidate_source(self,*_):
+    self.calibration_source=None
+    self.vars["roi"].set("0,0,1,1")
  def custom(self):
     p=filedialog.askopenfilename(filetypes=[("Trusted YOLO weights","*.pt")])
     if p:self.vars["model"].set(p)
@@ -86,20 +92,24 @@ class Panel:
         self.line_dialog(im,source)
     self.frame.after(100,poll)
  def line_dialog(self,im,source):
-    win=tk.Toplevel(self.frame);win.title("Atur garis hitung — "+self.port.upper());win.transient(self.frame.winfo_toplevel())
+    win=tk.Toplevel(self.frame);win.title("Area deteksi & garis hitung — "+self.port.upper());win.transient(self.frame.winfo_toplevel())
     im.thumbnail((min(1100,win.winfo_screenwidth()-100),min(620,win.winfo_screenheight()-240)))
     w,h=im.size
     photo=ImageTk.PhotoImage(im,master=win)
-    ttk.Label(win,text="Klik titik awal dan titik akhir garis. Panah menunjukkan arah kendaraan masuk.",wraplength=w).pack(padx=8,pady=6)
+    ttk.Label(win,text="Pilih Atur kotak ROI, klik dua sudut. Lalu pilih Atur garis, klik dua titik di dalam kotak. Panah menunjukkan arah masuk.",wraplength=w).pack(padx=8,pady=6)
     canvas=tk.Canvas(win,width=w,height=h,highlightthickness=0,cursor="crosshair");canvas.pack(padx=8)
     canvas.create_image(0,0,image=photo,anchor="nw");canvas.image=photo
     points=[];direction=tk.IntVar(value=int(self.vars["direction"].get()))
+    roi=list(roi_bounds(self.vars["roi"].get().split(",")));corners=[];edit_mode=tk.StringVar(value="roi")
     try:
         a=list(map(float,self.vars["line"].get().split(",")))
         if len(a)==4 and all(0<=v<=1 for v in a) and a[:2]!=a[2:]:points[:]=[(a[0],a[1]),(a[2],a[3])]
     except ValueError:pass
     def draw():
         canvas.delete("overlay")
+        x1,y1,x2,y2=roi
+        canvas.create_rectangle(x1*w,y1*h,x2*w,y2*h,outline="#00ff88",width=3,tags="overlay")
+        for x,y in corners:canvas.create_oval(x*w-4,y*h-4,x*w+4,y*h+4,fill="#00ff88",tags="overlay")
         for x,y in points:
             canvas.create_oval(x*w-5,y*h-5,x*w+5,y*h+5,fill="#ffe000",outline="black",tags="overlay")
         if len(points)==2:
@@ -114,25 +124,37 @@ class Panel:
                 canvas.create_line(mx-vx,my-vy,mx+vx,my+vy,fill="#00ffff",width=4,arrow="last",tags="overlay")
     def click(e):
         p=(min(1,max(0,e.x/w)),min(1,max(0,e.y/h)))
+        if edit_mode.get()=="roi":
+            if len(corners)==2:corners.clear()
+            corners.append(p)
+            if len(corners)==2:
+                try:roi[:]=roi_bounds((*corners[0],*corners[1]))
+                except ValueError:corners.clear();draw();return
+                if not all(inside_roi(q,roi) for q in points):points.clear()
+                edit_mode.set("line")
+            draw();return
+        if not inside_roi(p,roi):return
         if len(points)==2:points.clear()
         if points and ((p[0]-points[0][0])**2+(p[1]-points[0][1])**2)**.5<.01:return
         points.append(p);draw()
     def save():
-        if len(points)!=2:
-            messagebox.showwarning("Garis","Tentukan dua titik garis.",parent=win);return
+        if len(corners)==1 or len(points)!=2 or not all(inside_roi(q,roi) for q in points):
+            messagebox.showwarning("Kalibrasi","Selesaikan kotak ROI dan dua titik garis di dalamnya.",parent=win);return
         if source!=self.vars["source"].get().strip():
             messagebox.showwarning("Sumber","Sumber video berubah. Buka pengaturan ulang.",parent=win);win.destroy();return
         self.vars["line"].set(",".join(f"{v:.6f}" for p in points for v in p))
-        self.vars["direction"].set(str(direction.get()));self.calibration_source=source
+        self.vars["direction"].set(str(direction.get()));self.vars["roi"].set(",".join(f"{v:.6f}" for v in roi));self.calibration_source=source
         draw()
         # Render saved calibration in the main panel without running inference.
         preview=im.copy()
         from PIL import ImageDraw
-        pen=ImageDraw.Draw(preview);pen.line([(x*w,y*h) for x,y in points],fill="yellow",width=3)
+        pen=ImageDraw.Draw(preview);pen.rectangle((roi[0]*w,roi[1]*h,roi[2]*w,roi[3]*h),outline="#00ff88",width=3);pen.line([(x*w,y*h) for x,y in points],fill="yellow",width=3)
         preview.thumbnail((600,340));self.photo=ImageTk.PhotoImage(preview);self.preview.configure(image=self.photo,text="")
         self.info.set("Garis disimpan — siap Start");win.destroy()
     canvas.bind("<Button-1>",click)
     bar=ttk.Frame(win);bar.pack(fill="x",padx=8,pady=8)
+    ttk.Radiobutton(bar,text="Atur kotak ROI",variable=edit_mode,value="roi").pack(side="left")
+    ttk.Radiobutton(bar,text="Atur garis",variable=edit_mode,value="line").pack(side="left")
     ttk.Button(bar,text="Ulangi garis",command=lambda:(points.clear(),draw())).pack(side="left",padx=3)
     ttk.Button(bar,text="Balik arah masuk",command=lambda:(direction.set(-direction.get()),draw())).pack(side="left",padx=3)
     ttk.Button(bar,text="Batal",command=win.destroy).pack(side="right",padx=3)
@@ -148,6 +170,8 @@ class Panel:
         a=list(map(float,c["line"].split(",")));assert len(a)==4 and all(0<=x<=1 for x in a)
         assert 0<float(c["conf"])<=1 and 0<float(c["iou"])<=1
         Crossing(a[:2],a[2:],int(c["direction"]))
+        c["roi"]=roi_bounds(c["roi"].split(","))
+        assert inside_roi(a[:2],c["roi"]) and inside_roi(a[2:],c["roi"])
         if c["device"]=="0" and not torch.cuda.is_available():raise ValueError("CUDA unavailable")
         if c["mode"]=="OPERATIONAL":
             if self.calibration_source!=c["source"].strip():
@@ -184,8 +208,8 @@ class Panel:
     cap=None
     try:
         model=YOLO(c["model"]);names=model.names
-        mapping={"car":"car","truck":"car","bus":"car","motorcycle":"motor"}
-        classes={int(k):mapping[v.lower()] for k,v in names.items() if v.lower() in mapping}
+        classes={int(k):vehicle_group(v) for k,v in names.items() if vehicle_group(v) is not None}
+        print(f"CLASS MAP {self.port}: "+str({k:(names[k],v) for k,v in classes.items()}),flush=True)
         if not classes:raise ValueError("Model requires COCO vehicle names")
         device=("0" if torch.cuda.is_available() else "cpu") if c["device"]=="auto" else c["device"]
         cap=cv2.VideoCapture(c["source"],cv2.CAP_FFMPEG,[cv2.CAP_PROP_OPEN_TIMEOUT_MSEC,8000,cv2.CAP_PROP_READ_TIMEOUT_MSEC,8000])
@@ -198,21 +222,26 @@ class Panel:
                 self.status.put(("info","END / STREAM LOST — restart after checking gap"));break
             t=now();newday=t.date().isoformat()
             if newday!=day:day=newday;car,motor=store.counts(self.port,day)
-            result=model.track(frame,persist=True,tracker=c["tracker"],classes=list(classes),conf=float(c["conf"]),iou=float(c["iou"]),imgsz=int(c["size"]),device=device,verbose=False)[0]
+            h,w=frame.shape[:2];rx,ry,ex,ey=roi_pixels(c["roi"],w,h)
+            crop=frame[ry:ey,rx:ex].copy()
+            result=model.track(crop,persist=True,tracker=c["tracker"],classes=list(classes),conf=float(c["conf"]),iou=float(c["iou"]),imgsz=int(c["size"]),device=device,verbose=False)[0]
             frame_id+=1;h,w=frame.shape[:2];changed=False
             if result.boxes.id is not None:
                 for xy,tid,cls,conf in zip(result.boxes.xyxy.cpu().tolist(),result.boxes.id.int().cpu().tolist(),result.boxes.cls.int().cpu().tolist(),result.boxes.conf.cpu().tolist()):
-                    x1,y1,x2,y2=xy;kind=counter.update(tid,((x1+x2)/(2*w),y2/h),classes[cls],frame_id,conf)
-                    if kind=="car":car+=1;changed=True
-                    elif kind=="motor":motor+=1;changed=True
+                    x1,y1,x2,y2=xy;point=((rx+(x1+x2)/2)/w,(ry+y2)/h)
+                    if not inside_roi(point,c["roi"]):continue
+                    kind=counter.update(tid,point,classes[cls],frame_id,conf)
                     if kind:
+                        before=(car,motor);car,motor=add_count(car,motor,kind);changed=True
                         tid0,raw,stable,votes=counter.last_event
-                        print(f'COUNT {self.port} ID={tid0} frame={frame_id} raw={raw} counted={stable} votes={votes}',flush=True)
+                        print(f'COUNT {self.port} ID={tid0} frame={frame_id} detector={names[cls]} raw={raw} counted={stable} votes={votes} before={before} after={(car,motor)}',flush=True)
             counter.prune(frame_id)
             if changed or time.monotonic()-last>=10:
                 store.snapshot(self.port,car,motor,t);last=time.monotonic()
             self.live.set()
-            annotated=result.plot()
+            annotated=(frame.astype("float32")*.45).astype("uint8")
+            annotated[ry:ey,rx:ex]=result.plot()
+            cv2.rectangle(annotated,(rx,ry),(ex-1,ey-1),(0,255,100),2)
             cv2.line(annotated,(int(a[0]*w),int(a[1]*h)),(int(a[2]*w),int(a[3]*h)),(0,255,255),3)
             cv2.putText(annotated,f"Mobil {car} | Motor {motor}",(12,30),cv2.FONT_HERSHEY_SIMPLEX,.8,(0,255,255),2)
             self.putframe(annotated)

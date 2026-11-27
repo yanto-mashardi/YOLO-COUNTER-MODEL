@@ -24,3 +24,6 @@ Export CSV to selected folder, including Google Drive Desktop synchronized folde
 
 ## Interactive counting line
 Before Start, choose local video or RTSP, click Atur garis hitung pada video, click two endpoints on the captured frame, use Balik arah masuk to orient the arrow, and save. Coordinates are normalized; preview does not run inference or publish data. Operational mode requires calibration for the current source in the current session. Local video is reopened at its beginning when Start is pressed. Calibration is in memory only; persistence and polygon ROI remain future work. Stop before editing. Windows GUI testing pending.
+
+## Detection ROI
+Use Atur area deteksi & garis hitung. Select two opposite corners of the green ROI, then draw the yellow counting line inside it and choose direction. Inference/tracking receives only the crop; coordinates are translated back to the full image for crossing. Outside is dimmed in preview. A source change resets ROI and invalidates calibration. Keep sufficient space on both sides of the counting line for tracking. Counting diagnostics print raw detector label, voted group and both counters before/after. ROI is session-only. Fixed model input size means CPU speedup is not guaranteed. Actual video validation remains required.

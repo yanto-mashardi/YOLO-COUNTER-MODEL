@@ -44,6 +44,26 @@ class Crossing:
     def prune(self,frame):
         self.tracks={k:v for k,v in self.tracks.items() if frame-v[3]<600}
         self.votes={k:v for k,v in self.votes.items() if k in self.tracks}
+def roi_bounds(values):
+    x1,y1,x2,y2=map(float,values)
+    x1,x2=sorted((x1,x2));y1,y2=sorted((y1,y2))
+    if not (0<=x1<x2<=1 and 0<=y1<y2<=1 and x2-x1>=.03 and y2-y1>=.03):
+        raise ValueError("Invalid ROI")
+    return x1,y1,x2,y2
+def roi_pixels(roi,w,h):
+    import math
+    x1,y1,x2,y2=roi_bounds(roi)
+    return int(x1*w),int(y1*h),min(w,math.ceil(x2*w)),min(h,math.ceil(y2*h))
+def inside_roi(point,roi):
+    x,y=point;x1,y1,x2,y2=roi
+    return x1<=x<=x2 and y1<=y<=y2
+def vehicle_group(name):
+    return {"car":"car","truck":"car","bus":"car","motorcycle":"motor"}.get(name.lower())
+def add_count(car,motor,kind):
+    if kind=="car":return car+1,motor
+    if kind=="motor":return car,motor+1
+    if kind is None:return car,motor
+    raise ValueError("Unknown counted class")
 class Store:
     def __init__(self,path):
         self.path=path

@@ -1,6 +1,6 @@
 import unittest,tempfile
 from pathlib import Path
-from core import Crossing,Store,now,payload
+from core import Crossing,Store,now,payload,roi_bounds,roi_pixels,inside_roi,vehicle_group,add_count
 class Tests(unittest.TestCase):
  def test_crossing(self):
     c=Crossing((.1,.5),(.9,.5))
@@ -31,6 +31,18 @@ class Tests(unittest.TestCase):
     c.update(12,(.5,.2),"car",1,.9)
     c.update(12,(.5,.3),"car",2,.8)
     self.assertEqual(c.update(12,(.5,.7),"motor",3,.5),"car")
+ def test_independent_counters(self):
+    car,motor=0,0
+    for label in ("car","motorcycle","motorcycle","truck","bus"):
+     car,motor=add_count(car,motor,vehicle_group(label))
+    self.assertEqual((car,motor),(3,2))
+ def test_roi_coordinates(self):
+    r=roi_bounds((.8,.9,.2,.1))
+    self.assertEqual(roi_pixels(r,1000,500),(200,50,800,450))
+    self.assertTrue(inside_roi((.5,.5),r))
+    self.assertFalse(inside_roi((.1,.5),r))
+ def test_roi_invalid(self):
+    with self.assertRaises(ValueError):roi_bounds((.2,.2,.2,.8))
  def test_store(self):
     with tempfile.TemporaryDirectory() as d:
      p=Path(d)/"test.sqlite";s=Store(p);t=now();s.snapshot("pakning",3,4,t)
