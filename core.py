@@ -1,5 +1,6 @@
 """Pure counting geometry, persistent snapshots and BIMA2 HTTPS client."""
 import sqlite3, json, urllib.request, urllib.parse
+from contextlib import contextmanager
 from datetime import datetime
 from zoneinfo import ZoneInfo
 WIB=ZoneInfo("Asia/Jakarta")
@@ -37,7 +38,14 @@ class Store:
         self.path=path
         with self.connect() as db:
             db.execute("CREATE TABLE IF NOT EXISTS snapshots(port TEXT, ts TEXT, car INTEGER, motor INTEGER, PRIMARY KEY(port,ts))")
-    def connect(self):return sqlite3.connect(self.path,timeout=10)
+    @contextmanager
+    def connect(self):
+        db=sqlite3.connect(self.path,timeout=10)
+        try:
+            with db:
+                yield db
+        finally:
+            db.close()
     def counts(self,port,day):
         with self.connect() as db:
             r=db.execute("SELECT car,motor FROM snapshots WHERE port=? AND substr(ts,1,10)=? ORDER BY ts DESC LIMIT 1",(port,day)).fetchone()
