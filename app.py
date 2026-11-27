@@ -8,6 +8,7 @@ from pathlib import Path
 import cv2,torch
 from PIL import Image,ImageTk
 from ultralytics import YOLO
+from video_source import youtube_url,resolve
 from support import save_profile,load_profile,metrics,archive
 from core import request,Crossing,Store,now,send_pending,roi_bounds,roi_pixels,inside_roi,vehicle_group,add_count
 ROOT=Path(os.environ.get("LOCALAPPDATA",str(Path.home())))/"YOLO_COUNTER_MODEL"
@@ -29,7 +30,9 @@ class Panel:
         if opts: w=ttk.Combobox(settings,textvariable=v,values=opts,state="readonly")
         else:w=ttk.Entry(settings,textvariable=v,show="*" if secret else "")
         w.pack(fill="x")
-    field("source","RTSP URL / file video","",secret=True)
+    field("source_type","Jenis sumber","Auto",["Auto","RTSP","YouTube","File lokal"])
+    field("source","URL RTSP / YouTube / file video","",secret=True)
+    field("youtube_height","Resolusi YouTube","720",["480","720","1080","Auto"])
     ttk.Button(settings,text="Pilih video lokal",command=lambda:self.vars["source"].set(filedialog.askopenfilename())).pack(anchor="w")
     field("model","Model YOLO","yolo11n.pt",MODELS)
     ttk.Button(settings,text="Pilih model .pt terpercaya",command=self.custom).pack(anchor="w")
@@ -44,6 +47,8 @@ class Panel:
     self.line_button=ttk.Button(settings,text="Atur area deteksi & garis hitung",command=self.edit_line);self.line_button.pack(fill="x",pady=4)
     self.calibration_source=None;self.calibrating=False
     self.vars["source"].trace_add("write",self.invalidate_source)
+    self.vars["source_type"].trace_add("write",self.invalidate_source)
+    self.vars["youtube_height"].trace_add("write",lambda *_:setattr(self,"calibration_source",None))
     self.vars["line"].trace_add("write",lambda *_:setattr(self,"calibration_source",None))
     self.vars["direction"].trace_add("write",lambda *_:setattr(self,"calibration_source",None))
     field("mode","Mode","VALIDATION",["VALIDATION","OPERATIONAL"])
@@ -51,6 +56,7 @@ class Panel:
     field("token","Token resmi per pelabuhan","",secret=True)
     field("archive","Folder ekspor CSV / Google Drive (opsional)","")
     ttk.Button(settings,text="Pilih folder arsip",command=lambda:self.vars["archive"].set(filedialog.askdirectory())).pack(anchor="w")
+    ttk.Button(settings,text="Test sumber video / atur ROI",command=self.edit_line).pack(fill="x",pady=4)
     ttk.Button(settings,text="Simpan konfigurasi",command=self.save_settings).pack(fill="x",pady=4)
     ttk.Button(settings,text="Periksa otorisasi BIMA2",command=self.check_api).pack(fill="x")
     row=ttk.Frame(monitor);row.pack(fill="x",pady=4)
@@ -129,6 +135,17 @@ class Panel:
  def custom(self):
     p=filedialog.askopenfilename(filetypes=[("Trusted YOLO weights","*.pt")])
     if p:self.vars["model"].set(p)
+ def source_kind(self,c):
+    kind=c["source_type"]
+    if kind!="Auto":return kind
+    if c["source"].startswith("rtsp://"):return "RTSP"
+    if c["source"].startswith(("https://","http://","<iframe")):return "YouTube"
+    return "File lokal"
+ def open_source(self,c):
+    kind=self.source_kind(c);url=c["source"];live=kind=="RTSP"
+    if kind=="YouTube":url,live=resolve(url,c["youtube_height"])
+    cap=cv2.VideoCapture(url,cv2.CAP_FFMPEG,[cv2.CAP_PROP_OPEN_TIMEOUT_MSEC,8000,cv2.CAP_PROP_READ_TIMEOUT_MSEC,8000])
+    return cap,live
  def edit_line(self):
     if self.calibrating or (self.worker and self.worker.is_alive()) or (self.sender and self.sender.is_alive()):
         messagebox.showinfo("Pengaturan garis","Hentikan pemrosesan terlebih dahulu.");return
@@ -137,10 +154,11 @@ class Panel:
         messagebox.showwarning("Sumber video","Masukkan RTSP atau pilih file video dahulu.");return
     self.calibrating=True;self.line_button.configure(state="disabled")
     result=queue.Queue(1)
+    config={k:v.get() for k,v in self.vars.items()}
     def read():
         cap=None
         try:
-            cap=cv2.VideoCapture(source,cv2.CAP_FFMPEG,[cv2.CAP_PROP_OPEN_TIMEOUT_MSEC,8000,cv2.CAP_PROP_READ_TIMEOUT_MSEC,8000])
+            cap,_=self.open_source(config)
             ok,frame=cap.read()
             if not ok:raise RuntimeError("No frame")
             result.put(Image.fromarray(cv2.cvtColor(frame,cv2.COLOR_BGR2RGB)))
@@ -234,7 +252,15 @@ class Panel:
     if self.sender and self.sender.is_alive():return
     c={k:v.get() for k,v in self.vars.items()}
     try:
+        c["source"]=c["source"].strip()
         assert c["source"] and c["model"]
+        kind=self.source_kind(c)
+        if kind=="YouTube":
+            youtube_url(c["source"])
+            if c["mode"]!="VALIDATION":
+                messagebox.showwarning("YouTube","YouTube hanya untuk mode Validation.");return
+        if kind=="RTSP" and not c["source"].startswith("rtsp://"):raise ValueError("Invalid RTSP")
+        if kind=="File lokal" and not Path(c["source"]).is_file():raise ValueError("Invalid local file")
         a=list(map(float,c["line"].split(",")));assert len(a)==4 and all(0<=x<=1 for x in a)
         assert 0<float(c["conf"])<=1 and 0<float(c["iou"])<=1
         Crossing(a[:2],a[2:],int(c["direction"]))
@@ -244,7 +270,7 @@ class Panel:
         if c["mode"]=="OPERATIONAL":
             if self.calibration_source!=c["source"].strip():
                 messagebox.showwarning("Kalibrasi","Atur dan simpan garis untuk sumber video ini sebelum mode operasional.");return
-            assert c["source"].startswith("rtsp://") and c["token"] and c["identity"].strip()
+            assert kind=="RTSP" and c["source"].startswith("rtsp://") and c["token"] and c["identity"].strip()
             if not messagebox.askyesno("Commissioning","Aktifkan pengiriman resmi? Pastikan garis dan arah tervalidasi, publisher Manager cocok, counter awal direkonsiliasi, dan tidak ada pengirim lain."):return
     except Exception:
         messagebox.showerror("Konfigurasi","Periksa sumber, parameter, perangkat, dan token.");return
@@ -284,22 +310,32 @@ class Panel:
         print(f"CLASS MAP {self.port}: "+str({k:(names[k],v) for k,v in classes.items()}),flush=True)
         if not classes:raise ValueError("Model requires COCO vehicle names")
         device=("0" if torch.cuda.is_available() else "cpu") if c["device"]=="auto" else c["device"]
-        cap=cv2.VideoCapture(c["source"],cv2.CAP_FFMPEG,[cv2.CAP_PROP_OPEN_TIMEOUT_MSEC,8000,cv2.CAP_PROP_READ_TIMEOUT_MSEC,8000])
-        if not cap.isOpened() and not c["source"].startswith("rtsp://"):raise RuntimeError("Source unavailable")
+        cap,is_live=self.open_source(c)
+        if not cap.isOpened() and not is_live:raise RuntimeError("Source unavailable")
         counter=Crossing(a[:2],a[2:],int(c["direction"]));day=now().date().isoformat()
         car,motor=store.counts(self.port,day);frame_id=0;last=0;started=time.monotonic()
         while not self.stop.is_set():
             ok,frame=cap.read()
             if not ok:
                 self.live.clear()
-                if not c["source"].startswith("rtsp://"):
+                if not is_live:
                     self.status.put(("info","END — video selesai"));break
                 if c["mode"]=="OPERATIONAL":
                     self.status.put(("info","RTSP LOST — Stop untuk rekonsiliasi sebelum restart"));break
                 cap.release()
-                self.status.put(("info","RTSP LOST — reconnect dalam 5 detik"))
+                self.status.put(("info","STREAM LOST — reconnect dalam 5 detik"))
                 if self.stop.wait(5):break
-                cap=cv2.VideoCapture(c["source"],cv2.CAP_FFMPEG,[cv2.CAP_PROP_OPEN_TIMEOUT_MSEC,8000,cv2.CAP_PROP_READ_TIMEOUT_MSEC,8000])
+                while not self.stop.is_set():
+                    try:
+                        cap,is_live=self.open_source(c)
+                        if cap.isOpened():break
+                        cap.release()
+                    except Exception:
+                        self.status.put(("info","Reconnect gagal; coba lagi dalam 5 detik"))
+                    if self.stop.wait(5):break
+                if self.stop.is_set():break
+                if not is_live:
+                    self.status.put(("info","Live berakhir — Stop untuk mencegah replay"));break
                 model=YOLO(c["model"]);counter=Crossing(a[:2],a[2:],int(c["direction"]))
                 continue
             t=now();newday=t.date().isoformat()

@@ -65,4 +65,10 @@ class Tests(unittest.TestCase):
      archive(s,"pakning",d);archive(s,"pakning",d)
      p=Path(d)/"PAKNING"/("VEHICLES_PAKNING_"+t.date().isoformat()+".csv")
      self.assertIn("jam,jumlah_motor,jumlah_mobil",p.read_text())
+ def test_youtube_urls(self):
+    from video_source import youtube_url
+    expected="https://www.youtube.com/watch?v=kC4sXn8pTco"
+    for u in (expected,"https://youtu.be/kC4sXn8pTco","https://www.youtube.com/embed/kC4sXn8pTco?si=x",'<iframe src="https://www.youtube.com/embed/kC4sXn8pTco"></iframe>'):
+     self.assertEqual(youtube_url(u),expected)
+    with self.assertRaises(ValueError):youtube_url("https://example.com/watch?v=kC4sXn8pTco")
 if __name__=="__main__":unittest.main()
