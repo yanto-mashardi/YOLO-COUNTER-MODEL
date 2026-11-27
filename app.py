@@ -8,7 +8,8 @@ from pathlib import Path
 import cv2,torch
 from PIL import Image,ImageTk
 from ultralytics import YOLO
-from core import Crossing,Store,now,send_pending,roi_bounds,roi_pixels,inside_roi,vehicle_group,add_count
+from support import save_profile,load_profile,metrics,archive
+from core import request,Crossing,Store,now,send_pending,roi_bounds,roi_pixels,inside_roi,vehicle_group,add_count
 ROOT=Path(os.environ.get("LOCALAPPDATA",str(Path.home())))/"YOLO_COUNTER_MODEL"
 ROOT.mkdir(parents=True,exist_ok=True)
 BASE="https://eta-etd.gudang-apps.my.id"
@@ -17,18 +18,21 @@ class Panel:
  def __init__(self,parent,port):
     self.port=port;self.stop=threading.Event();self.worker=None;self.sender=None
     self.frames=queue.Queue(1);self.status=queue.Queue();self.live=threading.Event()
-    self.vars={}
-    self.frame=ttk.LabelFrame(parent,text=port.upper(),padding=8);self.frame.pack(side="left",fill="both",expand=True,padx=5)
+    self.vars={};self.show_video=threading.Event();self.show_video.set();self.archive_thread=None;self.run_mode=None;self.run_config=None
+    self.frame=ttk.Frame(parent,padding=8);parent.add(self.frame,text=port.upper())
+    tabs=ttk.Notebook(self.frame);tabs.pack(fill="both",expand=True)
+    monitor=ttk.Frame(tabs,padding=8);settings=ttk.Frame(tabs,padding=8);validation=ttk.Frame(tabs,padding=8)
+    tabs.add(monitor,text="Monitoring");tabs.add(settings,text="Konfigurasi");tabs.add(validation,text="Validasi");self.tabs=tabs;self.monitor=monitor
     def field(k,label,value="",opts=None,secret=False):
-        ttk.Label(self.frame,text=label).pack(anchor="w")
+        ttk.Label(settings,text=label).pack(anchor="w")
         v=tk.StringVar(value=value);self.vars[k]=v
-        if opts: w=ttk.Combobox(self.frame,textvariable=v,values=opts,state="readonly")
-        else:w=ttk.Entry(self.frame,textvariable=v,show="*" if secret else "")
+        if opts: w=ttk.Combobox(settings,textvariable=v,values=opts,state="readonly")
+        else:w=ttk.Entry(settings,textvariable=v,show="*" if secret else "")
         w.pack(fill="x")
     field("source","RTSP URL / file video","",secret=True)
-    ttk.Button(self.frame,text="Pilih video lokal",command=lambda:self.vars["source"].set(filedialog.askopenfilename())).pack(anchor="w")
+    ttk.Button(settings,text="Pilih video lokal",command=lambda:self.vars["source"].set(filedialog.askopenfilename())).pack(anchor="w")
     field("model","Model YOLO","yolo11n.pt",MODELS)
-    ttk.Button(self.frame,text="Pilih model .pt terpercaya",command=self.custom).pack(anchor="w")
+    ttk.Button(settings,text="Pilih model .pt terpercaya",command=self.custom).pack(anchor="w")
     field("device","Perangkat inferensi","auto",["auto","cpu","0"])
     field("tracker","Tracker","bytetrack.yaml",["bytetrack.yaml","botsort.yaml"])
     field("conf","Confidence","0.35")
@@ -37,7 +41,7 @@ class Panel:
     field("line","Garis x1,y1,x2,y2 (0-1)",".1,.5,.9,.5")
     field("direction","Arah masuk","1",["1","-1"])
     self.vars["roi"]=tk.StringVar(value="0,0,1,1")
-    self.line_button=ttk.Button(self.frame,text="Atur area deteksi & garis hitung",command=self.edit_line);self.line_button.pack(fill="x",pady=4)
+    self.line_button=ttk.Button(settings,text="Atur area deteksi & garis hitung",command=self.edit_line);self.line_button.pack(fill="x",pady=4)
     self.calibration_source=None;self.calibrating=False
     self.vars["source"].trace_add("write",self.invalidate_source)
     self.vars["line"].trace_add("write",lambda *_:setattr(self,"calibration_source",None))
@@ -46,15 +50,79 @@ class Panel:
     field("identity","Identitas publisher",os.environ.get("COMPUTERNAME","PC-KAMPUS-YOLO"))
     field("token","Token resmi per pelabuhan","",secret=True)
     field("archive","Folder ekspor CSV / Google Drive (opsional)","")
-    ttk.Button(self.frame,text="Pilih folder arsip",command=lambda:self.vars["archive"].set(filedialog.askdirectory())).pack(anchor="w")
-    row=ttk.Frame(self.frame);row.pack(fill="x",pady=4)
+    ttk.Button(settings,text="Pilih folder arsip",command=lambda:self.vars["archive"].set(filedialog.askdirectory())).pack(anchor="w")
+    ttk.Button(settings,text="Simpan konfigurasi",command=self.save_settings).pack(fill="x",pady=4)
+    ttk.Button(settings,text="Periksa otorisasi BIMA2",command=self.check_api).pack(fill="x")
+    row=ttk.Frame(monitor);row.pack(fill="x",pady=4)
     for name,fn in [("Start",self.start),("Stop",self.halt),("Ekspor CSV",self.export)]:
         ttk.Button(row,text=name,command=fn).pack(side="left",expand=True,fill="x")
-    self.preview=ttk.Label(self.frame,text="Preview belum aktif");self.preview.pack()
-    self.info=tk.StringVar(value="STOPPED");ttk.Label(self.frame,textvariable=self.info,wraplength=500).pack(anchor="w")
-    self.net=tk.StringVar(value="PUBLISH OFF");ttk.Label(self.frame,textvariable=self.net,wraplength=500).pack(anchor="w")
+    self.preview_toggle=tk.BooleanVar(value=True)
+    ttk.Checkbutton(monitor,text="Tampilkan video (nonaktif = headless)",variable=self.preview_toggle,command=self.toggle_preview).pack(anchor="w")
+    self.preview=ttk.Label(monitor,text="Preview belum aktif");self.preview.pack()
+    self.info=tk.StringVar(value="STOPPED");ttk.Label(monitor,textvariable=self.info,wraplength=500).pack(anchor="w")
+    self.net=tk.StringVar(value="PUBLISH OFF");ttk.Label(monitor,textvariable=self.net,wraplength=500).pack(anchor="w")
     self.store=None
+    self.manual_car=tk.IntVar(value=0);self.manual_motor=tk.IntVar(value=0)
+    ttk.Label(validation,text="Hitung manual pada video dan periode yang sama; evaluasi setelah Stop.").pack(anchor="w")
+    for label,var in [("Mobil manual",self.manual_car),("Motor manual",self.manual_motor)]:
+        bar=ttk.Frame(validation);bar.pack(fill="x",pady=6);ttk.Label(bar,text=label).pack(side="left")
+        ttk.Entry(bar,textvariable=var,width=8).pack(side="left")
+        ttk.Button(bar,text="+1",command=lambda v=var:v.set(v.get()+1)).pack(side="left")
+        ttk.Button(bar,text="-1",command=lambda v=var:v.set(max(0,v.get()-1))).pack(side="left")
+    self.eval_text=tk.StringVar(value="Belum dievaluasi")
+    ttk.Button(validation,text="Evaluasi hasil",command=self.evaluate).pack(anchor="w")
+    ttk.Label(validation,textvariable=self.eval_text,wraplength=800).pack(anchor="w",pady=12)
+    self.profile_path=ROOT/("profile_"+port+".json")
+    try:
+        p=load_profile(self.profile_path)
+        for k in ["source"]+[k for k in self.vars if k not in ("source","token","mode")]:
+            if k in p:self.vars[k].set(p[k])
+    except Exception:self.info.set("Profil tidak dapat dibaca")
     self.frame.after(100,self.tick)
+ def save_settings(self):
+    if self.worker and self.worker.is_alive():messagebox.showwarning("Konfigurasi","Stop dahulu.");return
+    try:
+        save_profile(self.profile_path,{k:v.get() for k,v in self.vars.items()})
+        messagebox.showinfo("Konfigurasi","Tersimpan lokal. Kredensial RTSP dan token tidak disimpan.")
+    except Exception as e:messagebox.showerror("Konfigurasi",type(e).__name__)
+ def toggle_preview(self):
+    if self.preview_toggle.get():self.show_video.set()
+    else:
+        self.show_video.clear();self.preview.configure(image="",text="HEADLESS — counting tetap berjalan")
+ def check_api(self):
+    device=self.vars["identity"].get();token=self.vars["token"].get()
+    if not token:messagebox.showwarning("BIMA2","Isi token publisher.");return
+    from urllib.parse import urlencode
+    def check():
+        try:
+            p=request(BASE+"/api/vehicles/"+self.port+"/resume?"+urlencode({"device":device}),token)
+            self.status.put(("net","AUTH OK | Cutover: "+str(p["cutoff"])+" | Cursor: "+str(p["last_ts"])))
+        except Exception as e:self.status.put(("net","AUTH ERROR: "+type(e).__name__))
+    threading.Thread(target=check,daemon=True).start();self.tabs.select(self.monitor)
+ def evaluate(self):
+    if not self.store or self.run_mode!="VALIDATION" or (self.worker and self.worker.is_alive()):
+        messagebox.showwarning("Validasi","Selesaikan satu run Validation dahulu.");return
+    try:
+        ends={}
+        for ts,c,m in self.store.rows(self.port):ends[ts[:10]]=(c,m)
+        if not ends:raise ValueError("No data")
+        c=sum(x[0] for x in ends.values());m=sum(x[1] for x in ends.values())
+        mc,mm=self.manual_car.get(),self.manual_motor.get();ec,em,w=metrics(mc,mm,c,m)
+        self.eval_text.set(f"Manual {mc}/{mm} | YOLO {c}/{m} | Error mobil {ec}, motor {em} | WAPE "+("N/A" if w is None else f"{w:.2f}%"))
+        with (ROOT/("evaluation_"+self.port+".csv")).open("a",newline="",encoding="utf-8") as f:
+            writer=csv.writer(f)
+            if f.tell()==0:writer.writerow(["timestamp","model","size","manual_car","manual_motor","yolo_car","yolo_motor","wape"])
+            writer.writerow([now().isoformat(),self.run_config["model"],self.run_config["size"],mc,mm,c,m,w])
+    except Exception as e:messagebox.showerror("Validasi",type(e).__name__)
+ def archive_loop(self,c,store):
+    while not self.stop.is_set():
+        try:archive(store,self.port,c["archive"])
+        except Exception as e:self.status.put(("net","ARCHIVE ERROR: "+type(e).__name__))
+        self.stop.wait(60)
+    self.worker.join()
+    try:archive(store,self.port,c["archive"])
+    except Exception as e:self.status.put(("net","ARCHIVE ERROR: "+type(e).__name__))
+
  def invalidate_source(self,*_):
     self.calibration_source=None
     self.vars["roi"].set("0,0,1,1")
@@ -180,12 +248,15 @@ class Panel:
             if not messagebox.askyesno("Commissioning","Aktifkan pengiriman resmi? Pastikan garis dan arah tervalidasi, publisher Manager cocok, counter awal direkonsiliasi, dan tidak ada pengirim lain."):return
     except Exception:
         messagebox.showerror("Konfigurasi","Periksa sumber, parameter, perangkat, dan token.");return
-    self.stop.clear();self.live.clear()
+    if self.archive_thread and self.archive_thread.is_alive():return
+    self.stop.clear();self.live.clear();self.run_mode=c["mode"];self.run_config=c;self.manual_car.set(0);self.manual_motor.set(0);self.tabs.select(self.monitor)
     name="official" if c["mode"]=="OPERATIONAL" else "validation_"+uuid.uuid4().hex
     self.store=Store(ROOT/(name+"_"+self.port+".sqlite"))
     self.worker=threading.Thread(target=self.run,args=(c,a,self.store),daemon=True);self.worker.start()
     if c["mode"]=="OPERATIONAL":
         self.sender=threading.Thread(target=self.publish,args=(c,self.store),daemon=True);self.sender.start()
+        if c["archive"]:
+            self.archive_thread=threading.Thread(target=self.archive_loop,args=(c,self.store),daemon=True);self.archive_thread.start()
     else:self.net.set("VALIDATION: tidak mengirim ke VPS")
  def halt(self):
     self.stop.set();self.live.clear()
@@ -196,7 +267,8 @@ class Panel:
             (self.net if kind=="net" else self.info).set(text)
     except queue.Empty:pass
     try:
-        im=self.frames.get_nowait();self.photo=ImageTk.PhotoImage(im);self.preview.configure(image=self.photo,text="")
+        im=self.frames.get_nowait()
+        if self.show_video.is_set():self.photo=ImageTk.PhotoImage(im);self.preview.configure(image=self.photo,text="")
     except queue.Empty:pass
     self.frame.after(100,self.tick)
  def putframe(self,frame):
@@ -213,13 +285,23 @@ class Panel:
         if not classes:raise ValueError("Model requires COCO vehicle names")
         device=("0" if torch.cuda.is_available() else "cpu") if c["device"]=="auto" else c["device"]
         cap=cv2.VideoCapture(c["source"],cv2.CAP_FFMPEG,[cv2.CAP_PROP_OPEN_TIMEOUT_MSEC,8000,cv2.CAP_PROP_READ_TIMEOUT_MSEC,8000])
-        if not cap.isOpened():raise RuntimeError("Source unavailable")
+        if not cap.isOpened() and not c["source"].startswith("rtsp://"):raise RuntimeError("Source unavailable")
         counter=Crossing(a[:2],a[2:],int(c["direction"]));day=now().date().isoformat()
         car,motor=store.counts(self.port,day);frame_id=0;last=0;started=time.monotonic()
         while not self.stop.is_set():
             ok,frame=cap.read()
             if not ok:
-                self.status.put(("info","END / STREAM LOST — restart after checking gap"));break
+                self.live.clear()
+                if not c["source"].startswith("rtsp://"):
+                    self.status.put(("info","END — video selesai"));break
+                if c["mode"]=="OPERATIONAL":
+                    self.status.put(("info","RTSP LOST — Stop untuk rekonsiliasi sebelum restart"));break
+                cap.release()
+                self.status.put(("info","RTSP LOST — reconnect dalam 5 detik"))
+                if self.stop.wait(5):break
+                cap=cv2.VideoCapture(c["source"],cv2.CAP_FFMPEG,[cv2.CAP_PROP_OPEN_TIMEOUT_MSEC,8000,cv2.CAP_PROP_READ_TIMEOUT_MSEC,8000])
+                model=YOLO(c["model"]);counter=Crossing(a[:2],a[2:],int(c["direction"]))
+                continue
             t=now();newday=t.date().isoformat()
             if newday!=day:day=newday;car,motor=store.counts(self.port,day)
             h,w=frame.shape[:2];rx,ry,ex,ey=roi_pixels(c["roi"],w,h)
@@ -239,12 +321,13 @@ class Panel:
             if changed or time.monotonic()-last>=10:
                 store.snapshot(self.port,car,motor,t);last=time.monotonic()
             self.live.set()
-            annotated=(frame.astype("float32")*.45).astype("uint8")
-            annotated[ry:ey,rx:ex]=result.plot()
-            cv2.rectangle(annotated,(rx,ry),(ex-1,ey-1),(0,255,100),2)
-            cv2.line(annotated,(int(a[0]*w),int(a[1]*h)),(int(a[2]*w),int(a[3]*h)),(0,255,255),3)
-            cv2.putText(annotated,f"Mobil {car} | Motor {motor}",(12,30),cv2.FONT_HERSHEY_SIMPLEX,.8,(0,255,255),2)
-            self.putframe(annotated)
+            if self.show_video.is_set():
+                annotated=(frame.astype("float32")*.45).astype("uint8")
+                annotated[ry:ey,rx:ex]=result.plot()
+                cv2.rectangle(annotated,(rx,ry),(ex-1,ey-1),(0,255,100),2)
+                cv2.line(annotated,(int(a[0]*w),int(a[1]*h)),(int(a[2]*w),int(a[3]*h)),(0,255,255),3)
+                cv2.putText(annotated,f"Mobil {car} | Motor {motor}",(12,30),cv2.FONT_HERSHEY_SIMPLEX,.8,(0,255,255),2)
+                self.putframe(annotated)
             self.status.put(("info",f"{c['mode']} | {device} | {frame_id/max(.01,time.monotonic()-started):.1f} FPS | Mobil {car} | Motor {motor}"))
     except Exception as e:self.status.put(("info","ERROR: "+type(e).__name__+" — check source/model/device"))
     finally:
@@ -269,11 +352,14 @@ class Panel:
 def main():
  root=tk.Tk();root.title("BIMA2 | YOLO Counter Model");root.geometry("1250x950")
  ttk.Label(root,text="YOLO Counter Model — Bengkalis & Pakning",font=("Segoe UI",18,"bold")).pack(pady=8)
- canvas=tk.Canvas(root);scroll=ttk.Scrollbar(root,orient="vertical",command=canvas.yview);scroll.pack(side="right",fill="y");canvas.pack(fill="both",expand=True);canvas.configure(yscrollcommand=scroll.set)
- body=ttk.Frame(canvas);win=canvas.create_window((0,0),window=body,anchor="nw");body.bind("<Configure>",lambda e:canvas.configure(scrollregion=canvas.bbox("all")));canvas.bind("<Configure>",lambda e:canvas.itemconfigure(win,width=e.width))
+ body=ttk.Notebook(root);body.pack(fill="both",expand=True)
  panels=[Panel(body,p) for p in ("bengkalis","pakning")]
  def close():
     for p in panels:p.halt()
-    root.destroy()
+    def finish():
+        if any(t and t.is_alive() for p in panels for t in (p.worker,p.sender,p.archive_thread)):
+            root.after(200,finish);return
+        root.destroy()
+    finish()
  root.protocol("WM_DELETE_WINDOW",close);root.mainloop()
 if __name__=="__main__":main()

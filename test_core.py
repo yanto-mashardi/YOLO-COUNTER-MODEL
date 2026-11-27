@@ -48,4 +48,21 @@ class Tests(unittest.TestCase):
      p=Path(d)/"test.sqlite";s=Store(p);t=now();s.snapshot("pakning",3,4,t)
      self.assertEqual(Store(p).counts("pakning",t.date().isoformat()),(3,4))
      self.assertEqual(payload("PC",t.isoformat(),3,4)["state"]["jumlah_motor"],4)
+ def test_metrics(self):
+    from support import metrics
+    self.assertEqual(metrics(10,10,9,11),(1,1,10))
+    self.assertIsNone(metrics(0,0,0,0)[2])
+ def test_profile(self):
+    from support import save_profile,load_profile
+    with tempfile.TemporaryDirectory() as d:
+     p=Path(d)/"p.json";save_profile(p,{"source":"rtsp://u:secret@host/live/a","token":"secret","mode":"OPERATIONAL"})
+     self.assertEqual(load_profile(p)["source"],"rtsp://host/live/a")
+     self.assertNotIn("secret",p.read_text())
+ def test_archive(self):
+    from support import archive
+    with tempfile.TemporaryDirectory() as d:
+     s=Store(Path(d)/"x.sqlite");t=now();s.snapshot("pakning",3,4,t)
+     archive(s,"pakning",d);archive(s,"pakning",d)
+     p=Path(d)/"PAKNING"/("VEHICLES_PAKNING_"+t.date().isoformat()+".csv")
+     self.assertIn("jam,jumlah_motor,jumlah_mobil",p.read_text())
 if __name__=="__main__":unittest.main()
